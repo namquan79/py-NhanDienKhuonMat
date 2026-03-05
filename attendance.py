@@ -1,87 +1,133 @@
 import cv2
-import csv
+import sqlite3
+import pickle
 import numpy as np
 from datetime import datetime
-from pathlib import Path
 from insightface.app import FaceAnalysis
 from time import time
-last_mark_time = {}   # person_id -> last timestamp seconds
-COOLDOWN_SEC = 10     # ví dụ 10 giây
 
-DB_DIR = Path("db")
-CSV_PATH = Path("attendance.csv")
+from utils.text_draw import put_vietnamese_text
 
-#Đọc data
-def load_db():
-    people = []
-    for f in DB_DIR.glob("*.npz"):
-        data = np.load(f, allow_pickle=True)
-        people.append({
-            "person_id": str(data["person_id"]),
-            "name": str(data["name"]),
-            "emb": data["embedding"].astype(np.float32),
-        })
-    return people
+# ===== CONFIG =====
+DB_PATH = "data/attendance.db"
+CAM_INDEX = 0
+DET_SIZE = (320, 320)
 
-# Tính độ giống nhau giữa 2 khuôn mặt
+TH = 0.60          # ngưỡng cosine
+COOLDOWN_SEC = 10  # chống spam điểm danh 1 người liên tục
+last_mark_time = {}  # person_id -> last timestamp seconds
+
+msg_text = ""
+msg_until = 0.0
+
+
+# ===== DATA LOAD =====
+def load_people_from_sqlite(db_path=DB_PATH):
+    """
+    Load (person_id, name, embedding) từ SQLite.
+    - face_embeddings.embedding: BLOB pickle(np.ndarray)
+    - persons.name: lấy tên hiển thị (nếu có)
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("""
+            SELECT fe.person_id,
+                   COALESCE(p.name, fe.person_id) AS name,
+                   fe.embedding
+            FROM face_embeddings fe
+            LEFT JOIN persons p ON p.person_id = fe.person_id
+        """).fetchall()
+
+        people = []
+        for person_id, name, emb_blob in rows:
+            if emb_blob is None:
+                continue
+            emb = pickle.loads(emb_blob)
+            emb = np.asarray(emb, dtype=np.float32)
+            people.append({
+                "person_id": str(person_id),
+                "name": str(name),
+                "emb": emb,
+            })
+        return people
+    finally:
+        conn.close()
+
+
+# ===== MATH =====
 def cosine(a, b):
     a = a / (np.linalg.norm(a) + 1e-9)
     b = b / (np.linalg.norm(b) + 1e-9)
     return float(np.dot(a, b))
 
-#Kiểm tra hôm nay đã chấm chưa
-def marked_today(person_id, date_str):
-    if not CSV_PATH.exists():
+
+# ===== TOAST MESSAGE =====
+def set_msg(text, seconds=2):
+    global msg_text, msg_until
+    msg_text = text
+    msg_until = time() + seconds
+
+
+def draw_msg(frame):
+    """Vẽ toast tiếng Việt bằng put_vietnamese_text"""
+    if time() > msg_until or not msg_text:
+        return frame
+
+    h, w = frame.shape[:2]
+    cv2.rectangle(frame, (10, 10), (w - 10, 70), (0, 0, 0), -1)
+    frame = put_vietnamese_text(
+        frame,
+        msg_text,
+        (20, 20),
+        font_size=26,
+        color=(0, 255, 255),
+        thickness=2
+    )
+    return frame
+
+
+def can_mark_now(person_id: str) -> bool:
+    now = time()
+    last = last_mark_time.get(person_id, 0.0)
+    if now - last < COOLDOWN_SEC:
         return False
-    with open(CSV_PATH, "r", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if row["person_id"] == person_id and row["date"] == date_str:
-                return True
-    return False
+    last_mark_time[person_id] = now
+    return True
 
-# Ghi log vào CSV
-def mark(person_id, name, score):
-    now = datetime.now()
-    ts = now.isoformat(timespec="seconds")
-    date_str = now.strftime("%Y-%m-%d")
 
-    if marked_today(person_id, date_str):
-        return False, "Da diem danh hom nay"
+# ===== OPTIONAL: Ghi log vào SQLite (chuẩn hệ thống cuộc họp) =====
+def mark_sqlite(meeting_id: str, person_id: str, score: float, camera_id="cam0", db_path=DB_PATH):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("""
+            INSERT INTO attendance_events(meeting_id, person_id, event_type, ts, confidence, camera_id)
+            VALUES (?, ?, 'checkin', ?, ?, ?)
+        """, (meeting_id, person_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), float(score), camera_id))
+        conn.commit()
+    finally:
+        conn.close()
 
-    new_file = not CSV_PATH.exists()
-    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(["person_id", "name", "timestamp", "date", "score"])
-        w.writerow([person_id, name, ts, date_str, f"{score:.3f}"])
-    return True, "Diem danh OK"
 
 def main():
-    people = load_db()
+    people = load_people_from_sqlite(DB_PATH)
     if not people:
-        print("Chua co du lieu trong db/. Hay chay enroll.py truoc.")
+        print("Chưa có embedding trong SQLite. Hãy enroll trước (lưu vào face_embeddings).")
         return
 
     app = FaceAnalysis(name="buffalo_l")
-    app.prepare(ctx_id=0, det_size=(320, 320))
-    # Mở camera
-    cap = cv2.VideoCapture(0)
+    app.prepare(ctx_id=0, det_size=DET_SIZE)
+
+    cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
-        print("Khong mo duoc camera")
+        print("Không mở được camera")
         return
 
-    # Ngưỡng cosine: 0.35~0.6 tùy dữ liệu; start 0.45
-    TH = 0.45
-
-    # msg, msg_time = "", 0
-    frame_idx = 0
+    MEETING_ID = "mt001"  # đổi theo cuộc họp đang mở
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        frame_idx += 1
 
         faces = app.get(frame)
 
@@ -91,50 +137,67 @@ def main():
 
             best = None
             best_score = -1.0
+
             for p in people:
                 s = cosine(emb, p["emb"])
                 if s > best_score:
                     best_score = s
                     best = p
-            print("so diem giong:",  best)
-
-            msg = f"{best['name']}: {best_score:.2f}"
 
             sim_percent = max(0.0, min(100.0, best_score * 100.0))
+
             if best is not None and best_score >= TH:
                 label = f"{best['name']} | ID: {best['person_id']} | {sim_percent:.1f}%"
                 color = (0, 255, 0)
 
-                # Ghi dữ liệu vào csv:
-                # ok, m = mark(best["person_id"], best["name"], best_score)
-                # if ok:
-                #     msg, msg_time = f"{best['name']}: {m}", frame_idx
-                # else:
-                #     # chỉ hiện nhẹ, tránh spam
-                #     msg, msg_time = f"{best['name']}: {m}", frame_idx
+                # thông báo thành công (TV)
+                set_msg(f"Thành công: {best['name']} điểm danh OK", 2)
 
+                if can_mark_now(best["person_id"]):
+                    # Bật nếu muốn ghi log meeting
+                    # mark_sqlite(MEETING_ID, best["person_id"], best_score, camera_id=f"cam{CAM_INDEX}")
+                    pass
             else:
-                # label = f"Unknown {best_score:.2f}"
-                label = f"Unknown | {sim_percent:.1f}%"
+                label = f"Không xác định | {sim_percent:.1f}%"
                 color = (0, 0, 255)
 
+                # tránh spam toast liên tục: chỉ báo khi gần ngưỡng
+                if best_score >= TH - 0.05:
+                    set_msg("Thất bại: Độ giống chưa đủ ngưỡng", 1.2)
+
+            # Vẽ khung
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, label, (x1, max(20, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # if msg and (frame_idx - msg_time) < 60:
-        #     cv2.putText(frame, msg, (20, 40),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+            # Vẽ label tiếng Việt (thay cv2.putText)
+            frame = put_vietnamese_text(
+                frame,
+                label,
+                (x1, max(10, y1 - 32)),
+                font_size=24,
+                color=color,
+                thickness=2
+            )
 
-        cv2.putText(frame, "Q=Quit | TH=0.45 (edit in code)", (20, frame.shape[0] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        # Footer tiếng Việt
+        frame = put_vietnamese_text(
+            frame,
+            f"Q=Thoát | Ngưỡng={TH} | Cooldown={COOLDOWN_SEC}s",
+            (20, frame.shape[0] - 45),
+            font_size=22,
+            color=(255, 255, 255),
+            thickness=1
+        )
 
-        cv2.imshow("Attendance (InsightFace)", frame)
+        # Toast
+        frame = draw_msg(frame)
+
+        cv2.imshow("Diem danh (InsightFace)", frame)
         if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
             break
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

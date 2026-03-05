@@ -1,0 +1,1 @@
+delete from face_embeddings
