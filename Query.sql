@@ -1,5 +1,3 @@
-CREATE TABLE face_embeddings (
-  person_id TEXT PRIMARY KEY,
-  embedding BLOB,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
+delete from face_embeddings where person_id='123';
+
+delete from persons where person_id='123';
